@@ -1,5 +1,5 @@
 (*
- * Copyright (c) 2012 Anil Madhavapeddy <anil@recoil.org>
+ * Copyright (c) 2012-2013 Anil Madhavapeddy <anil@recoil.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -14,7 +14,119 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *)
 
-(** Manipulate external buffers as C-like structs *)
+(** Manipulate external memory buffers as C-like structures.
+
+Cstruct is a library and syntax extension to make it easier to access C-like
+structures directly from OCaml.  It supports both reading and writing to these
+memory buffers, and they are accessed via the [Bigarray] module.
+
+The library interface below is intended to be used in conjunction with the
+[pa_cstruct] camlp4 syntax extension that is also supplied with this library
+(in the [cstruct.syntax] ocamlfind package).
+
+An example description for the pcap packet format is:
+
+{[
+cstruct pcap_header {
+  uint32_t magic_number;   (* magic number *)
+  uint16_t version_major;  (* major version number *)
+  uint16_t version_minor;  (* minor version number *)
+  uint32_t thiszone;       (* GMT to local correction *)
+  uint32_t sigfigs;        (* accuracy of timestamps *)
+  uint32_t snaplen;        (* max length of captured packets, in octets *)
+  uint32_t network         (* data link type *)
+} as little_endian
+
+cstruct pcap_packet {
+  uint32_t ts_sec;         (* timestamp seconds *)
+  uint32_t ts_usec;        (* timestamp microseconds *)
+  uint32_t incl_len;       (* number of octets of packet saved in file *)
+  uint32_t orig_len        (* actual length of packet *)
+} as little_endian
+
+cstruct ethernet {
+  uint8_t        dst[6];
+  uint8_t        src[6];
+  uint16_t       ethertype
+} as big_endian
+
+cstruct ipv4 {
+  uint8_t        hlen_version;
+  uint8_t        tos;
+  uint16_t       len;
+  uint16_t       id;
+  uint16_t       off;
+  uint8_t        ttl;
+  uint8_t        proto;
+  uint16_t       csum;
+  uint8_t        src[4];
+  uint8_t        dst[4]
+} as big_endian
+]}
+
+These will expand to get and set functions for every field, with types
+appropriate to the particular definition.  For instance:
+
+{[
+val get_pcap_packet_ts_sec : Cstruct.t -> Cstruct.uint32
+val set_pcap_packet_ts_sec : Cstruct.t -> Cstruct.uint32 -> unit
+val get_pcap_packet_ts_usec : Cstruct.t -> Cstruct.uint32
+val set_pcap_packet_ts_usec : Cstruct.t -> Cstruct.uint32 -> unit
+val get_pcap_packet_incl_len : Cstruct.t -> Cstruct.uint32
+val set_pcap_packet_incl_len : Cstruct.t -> Cstruct.uint32 -> unit
+val get_pcap_packet_orig_len : Cstruct.t -> Cstruct.uint32
+val set_pcap_packet_orig_len : Cstruct.t -> Cstruct.uint32 -> unit
+val hexdump_pcap_packet_to_buffer : Buffer.t -> Cstruct.t -> unit
+]}
+
+The buffers generate a different set of functions. For the  [ethernet]
+definitions, we have:
+
+{[
+val sizeof_ethernet : int
+val get_ethernet_dst : Cstruct.t -> Cstruct.t
+val copy_ethernet_dst : Cstruct.t -> string
+val set_ethernet_dst : string -> int -> Cstruct.t -> unit
+val blit_ethernet_dst : Cstruct.t -> int -> Cstruct.t -> unit
+val get_ethernet_src : Cstruct.t -> Cstruct.t
+val copy_ethernet_src : Cstruct.t -> string
+]}
+
+You can also declare C-like enums:
+
+{[
+cenum foo32 {
+  ONE32;
+  TWO32 = 0xfffffffel;
+  THREE32
+} as uint32_t
+
+cenum bar16 {
+  ONE = 1;
+  TWO;
+  FOUR = 4;
+  FIVE
+} as uint16_t
+]}
+
+This generates signatures of the form:
+
+{[
+type foo32 = | ONE32 | TWO32 | THREE32
+val int_to_foo32 : int32 -> foo32 option
+val foo32_to_int : foo32 -> int32
+val foo32_to_string : foo32 -> string
+val string_to_foo32 : string -> foo32 option
+type bar16 = | ONE | TWO | FOUR | FIVE
+val int_to_bar16 : int -> bar16 option
+val bar16_to_int : bar16 -> int
+val bar16_to_string : bar16 -> string
+val string_to_bar16 : string -> bar16 option
+]}
+
+*)
+
+(** {2 Base types } *)
 
 type buffer = (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
 (** Type of a buffer. A cstruct is composed of an underlying buffer
@@ -27,7 +139,30 @@ type t = private {
 }
 (** Type of a cstruct. *)
 
-(** Functions that create a new cstruct. *)
+type byte = char
+(** A single byte type *)
+
+val byte : int -> byte
+(** Convert an integer to a single byte.  A value greater than
+    255 will raise an [Invalid_argument] exception *)
+
+type uint8 = int
+(** 8-bit unsigned integer.  The representation is currently an
+    unboxed OCaml integer. *)
+
+type uint16 = int
+(** 16-bit unsigned integer.  The representation is currently an
+    unboxed OCaml integer. *)
+
+type uint32 = int32
+(** 32-bit unsigned integer.  The representation is currently a
+    boxed OCaml int32. *)
+
+type uint64 = int64
+(** 64-bit unsigned integer.  The representation is currently a
+    boxed OCaml int64. *)
+
+(** {2 Creation} *)
 
 val of_bigarray: ?off:int -> ?len:int -> buffer -> t
 (** [of_bigarray ~off ~len b] is the cstruct contained in [b] starting
@@ -37,43 +172,40 @@ val create : int -> t
 (** [create len] is a cstruct of size [len] with an offset of 0. *)
 
 val of_string: ?allocator:(int -> t) -> string -> t
-(** [of_string ~alloc str] is the cstruct representation of [str],
-    with the underlying buffer allocated by [alloc]. If [alloc] is not
+(** [of_string ~allocator str] is the cstruct representation of [str],
+    with the underlying buffer allocated by [alloc]. If [allocator] is not
     provided, [create] is used. *)
 
-(** Functions that operate over cstructs. *)
+(** {2 Getters and Setters } *)
+
+val byte_to_int : byte -> int
+(** Convert a byte to an integer *)
 
 val check_bounds : t -> int -> bool
 (** [check_bounds cstr len] is [true] if [cstr.buffer]'s size is
     greater or equal than [len], [false] otherwise. *)
 
-type byte = char
-
-val byte : int -> byte
-val byte_to_int : byte -> int
-
-type bytes = string
-
-type uint8 = int
-type uint16 = int
-type uint32 = int32
-type uint64 = int64
-
-type ipv4 = int32
-
-val ipv4_to_string: ipv4 -> string
-
-type ipv6 = int64 * int64
-
-val ipv6_to_string: ipv6 -> string
-
 val get_char: t -> int -> char
+(** [get_char t off] returns the character contained in the cstruct
+     at offset [off].  It raises an [Invalid_argument] exception
+     if the offset exceeds the bounds of the cstruct. *)
 
 val get_uint8: t -> int -> uint8
+(** [get_uint8 t off] returns the byte contained in the cstruct
+     at offset [off].  It raises an [Invalid_argument] exception
+     if the offset exceeds the bounds of the cstruct. *)
 
 val set_char: t -> int -> char -> unit
+(** [set_char t off c] sets the byte contained in the cstruct
+     at offset [off] to character [c].
+     It raises an [Invalid_argument] exception if the offset
+     exceeds the bounds of the cstruct. *)
 
 val set_uint8: t -> int -> uint8 -> unit
+(** [set_uint8 t off c] sets the byte contained in the cstruct
+     at offset [off] to byte [c].
+     It raises an [Invalid_argument] exception if the offset
+     exceeds the bounds of the cstruct. *)
 
 val sub: t -> int -> int -> t
 (** [sub cstr off len] is [{ t with off = t.off + off; len }] *)
@@ -119,10 +251,19 @@ val blit_to_string: t -> int -> string -> int -> int -> unit
     a valid substring of [dst]. *)
 
 val len: t -> int
+(** Returns the length of the current cstruct view.  Note that this
+    length is potentially smaller than the actual size of the underlying
+    buffer, as the [sub] or [set_len] functions can construct a smaller view. *)
 
 val set_len : t -> int -> t
+(** Set the length of the buffer to a new absolute value, and return
+    a fresh cstruct with these settings.  A length that exceeds the size
+    of the underlying buffer will raise an [Invalid_argument] exception. *)
 
 val add_len : t -> int -> t
+(** [add_len t l] will add [l] bytes to the length of the buffer, and return
+    a fresh cstruct with these settings.  A length that exceeds the size
+    of the underlying buffer will raise an [Invalid_argument] exception. *)
 
 val split: ?start:int -> t -> int -> t * t
 (** [split ~start cstr len] is a tuple containing the cstruct
@@ -131,10 +272,24 @@ val split: ?start:int -> t -> int -> t * t
     element. *)
 
 val to_string: t -> string
+(** [to_string t] will allocate a fresh OCaml [string] and copy the
+    contents of the cstruct into it, and return that string copy. *)
+
+(** {2 Debugging } *)
 
 val hexdump: t -> unit
+(** When the going gets tough, the tough hexdump their cstructs
+    and peer at it until the bug disappears.  This will directly
+    prettyprint the contents of the cstruct to the standard output. *)
+
 val hexdump_to_buffer: Buffer.t -> t -> unit
+(** [hexdump_to_buffer buf c] will append the pretty-printed hexdump
+    of the cstruct [c] to the buffer [buf]. *)
+ 
 val debug: t -> string
+(** [debug t] will print out the internal details of a cstruct such
+    as its base offset and the length, and raise an assertion failure
+    if invariants have been violated.  Not intended for casual use. *)
 
 module BE : sig
 
